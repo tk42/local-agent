@@ -116,11 +116,11 @@ impl LlmConfig {
                 .unwrap_or_else(|_| "http://localhost:8080/v1".into()),
             api_key: std::env::var("LLM_API_KEY")
                 .unwrap_or_else(|_| "sk-no-key-required".into()),
-            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "qwen3.5".into()),
+            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "any-model-name".into()),
             max_tokens: std::env::var("LLM_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8192),
+                .unwrap_or(32768),
             temperature: std::env::var("LLM_TEMPERATURE")
                 .ok()
                 .and_then(|v| v.parse().ok())

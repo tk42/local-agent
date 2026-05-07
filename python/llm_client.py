@@ -20,8 +20,8 @@ load_dotenv(override=True)
 
 BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8080/v1")
 API_KEY = os.getenv("LLM_API_KEY", "sk-no-key-required")
-MODEL = os.getenv("LLM_MODEL", "qwen3.5")
-MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+MODEL = os.getenv("LLM_MODEL", "any-model-name")
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "32768"))
 TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
