@@ -111,12 +111,13 @@ pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
     pub max_tokens: u32,
+    pub context_tokens: u32,
     pub temperature: f64,
 }
 
 impl LlmConfig {
     pub fn from_env() -> Self {
-        Self {
+        let mut cfg = Self {
             base_url: std::env::var("LLM_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:8080/v1".into()),
             api_key: std::env::var("LLM_API_KEY")
@@ -125,11 +126,35 @@ impl LlmConfig {
             max_tokens: std::env::var("LLM_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(32768),
+                .unwrap_or(8192),
+            context_tokens: std::env::var("LLM_CONTEXT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(65536),
             temperature: std::env::var("LLM_TEMPERATURE")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.6),
+        };
+        cfg.reclamp();
+        cfg
+    }
+
+    /// Ensure `max_tokens` leaves room for prompt within `context_tokens`.
+    /// llama-server rejects requests where prompt + max_tokens > n_ctx, so cap
+    /// max_tokens at n_ctx/8 when it grows past 7/8 of the window.
+    pub fn reclamp(&mut self) {
+        if self.context_tokens == 0 {
+            return;
+        }
+        let limit = self.context_tokens.saturating_mul(7) / 8;
+        if self.max_tokens >= limit {
+            let clamped = (self.context_tokens / 8).max(256);
+            eprintln!(
+                "\x1b[33m[warn] LLM_MAX_TOKENS={} >= LLM_CONTEXT_TOKENS={}; clamping to {}\x1b[0m",
+                self.max_tokens, self.context_tokens, clamped
+            );
+            self.max_tokens = clamped;
         }
     }
 }
@@ -151,6 +176,16 @@ impl LlmClient {
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { config, http }
+    }
+
+    pub fn set_context_tokens(&mut self, n: u32) {
+        self.config.context_tokens = n;
+        self.config.reclamp();
+    }
+
+    pub fn set_max_tokens(&mut self, n: u32) {
+        self.config.max_tokens = n;
+        self.config.reclamp();
     }
 
     /// Streaming chat completion with tool support.
@@ -276,7 +311,18 @@ impl LlmClient {
                 // Server closed without emitting `[DONE]` (e.g. llama-server
                 // sometimes does this on hitting max_tokens) — treat as end.
                 Err(reqwest_eventsource::Error::StreamEnded) => break,
-                Err(e) => bail!("SSE stream error: {}", e),
+                Err(e) => {
+                    let prompt_tok_est = serde_json::to_string(body)
+                        .map(|s| s.len() / 4)
+                        .unwrap_or(0);
+                    bail!(
+                        "SSE stream error: {} (prompt≈{} tok, max_tokens={}, n_ctx={} — server may have rejected oversized prompt; try /clear, /compact, or lower /maxtokens)",
+                        e,
+                        prompt_tok_est,
+                        self.config.max_tokens,
+                        self.config.context_tokens
+                    );
+                }
             }
         }
         es.close();
@@ -412,6 +458,7 @@ mod message_wire_tests {
             api_key: "x".into(),
             model: "m".into(),
             max_tokens: 10,
+            context_tokens: 65536,
             temperature: 0.5,
         };
         let msgs = vec![Message::user("hi")];
@@ -429,6 +476,7 @@ mod message_wire_tests {
             api_key: "x".into(),
             model: "m".into(),
             max_tokens: 10,
+            context_tokens: 65536,
             temperature: 0.5,
         };
         let msgs = vec![Message::user("hi")];

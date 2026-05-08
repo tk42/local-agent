@@ -14,7 +14,12 @@ use anyhow::Result;
 
 use crate::llm_client::{LlmClient, Message};
 
-pub const TOKEN_THRESHOLD: usize = 80_000;
+/// Auto-compact threshold sized to a fraction of llama-server's `n_ctx`.
+/// 60% leaves headroom for `max_tokens`, system prompt, and the next tool
+/// result that will be appended after compaction.
+pub fn token_threshold(context_tokens: u32) -> usize {
+    (context_tokens as usize) * 6 / 10
+}
 
 fn transcript_dir() -> PathBuf {
     let dir = std::env::current_dir()
@@ -30,13 +35,14 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
 }
 
 /// Clear old tool result content to save space.
-/// Keeps only the 3 most recent tool results intact.
+/// Normally keeps the 3 most recent tool results intact; when `aggressive`
+/// is true (caller is near the token threshold), keeps only the most recent 1.
 ///
 /// Also clears the matching assistant tool_call.arguments (by id) so we don't
 /// keep paying for huge argument blobs when the corresponding result is gone.
 /// IDs are preserved on both sides — that integrity is what OpenAI-compatible
 /// servers validate.
-pub fn microcompact(messages: &mut [Message]) {
+pub fn microcompact(messages: &mut [Message], aggressive: bool) {
     let tool_pairs: Vec<(usize, String)> = messages
         .iter()
         .enumerate()
@@ -49,11 +55,12 @@ pub fn microcompact(messages: &mut [Message]) {
         })
         .collect();
 
-    if tool_pairs.len() <= 3 {
+    let keep = if aggressive { 1 } else { 3 };
+    if tool_pairs.len() <= keep {
         return;
     }
 
-    let cutoff = tool_pairs.len() - 3;
+    let cutoff = tool_pairs.len() - keep;
     let ids_to_clear: std::collections::HashSet<String> = tool_pairs[..cutoff]
         .iter()
         .map(|(_, id)| id.clone())
@@ -61,7 +68,7 @@ pub fn microcompact(messages: &mut [Message]) {
 
     for (idx, _) in &tool_pairs[..cutoff] {
         if let Some(ref content) = messages[*idx].content {
-            if content.len() > 200 {
+            if content.len() > 500 {
                 messages[*idx].content = Some("[cleared]".into());
             }
         }
@@ -132,9 +139,12 @@ pub async fn auto_compact(client: &LlmClient, messages: &[Message]) -> Result<Ve
 pub async fn maybe_compact(
     client: &LlmClient,
     messages: &mut Vec<Message>,
+    context_tokens: u32,
 ) -> Result<()> {
-    microcompact(messages);
-    if estimate_tokens(messages) > TOKEN_THRESHOLD {
+    let threshold = token_threshold(context_tokens);
+    let est = estimate_tokens(messages);
+    microcompact(messages, est > threshold * 8 / 10);
+    if estimate_tokens(messages) > threshold {
         eprintln!("\x1b[90m[auto-compact triggered]\x1b[0m");
         let new_messages = auto_compact(client, messages).await?;
         *messages = new_messages;

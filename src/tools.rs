@@ -10,6 +10,11 @@ use std::process::Command;
 
 use serde_json::Value;
 
+/// Per-tool-result byte cap. Sized for n_ctx=65536: 3 retained tool results ×
+/// 20K bytes ≈ 15K tokens, leaving room for the rest of the conversation,
+/// system prompt, and `max_tokens` output budget.
+const TOOL_RESULT_CAP: usize = 20_000;
+
 /// Truncate a string to at most `max` bytes, but never split a UTF-8
 /// codepoint. Returns an owned String for ergonomic use in formatters.
 fn truncate_utf8(s: &str, max: usize) -> String {
@@ -84,8 +89,8 @@ pub fn run_bash(workdir: &Path, command: &str) -> String {
             let out = format!("{}{}", stdout, stderr).trim().to_string();
             if out.is_empty() {
                 "(no output)".into()
-            } else if out.len() > 50000 {
-                truncate_utf8(&out, 50000)
+            } else if out.len() > TOOL_RESULT_CAP {
+                truncate_utf8(&out, TOOL_RESULT_CAP)
             } else {
                 out
             }
@@ -116,8 +121,8 @@ pub fn run_read_file(workdir: &Path, path: &str, offset: usize, limit: usize) ->
                 .map(|(i, line)| format!("{:4}  {}", i + line_start, line))
                 .collect();
             let mut result = numbered.join("\n");
-            if result.len() > 50000 {
-                let mut end = 50000;
+            if result.len() > TOOL_RESULT_CAP {
+                let mut end = TOOL_RESULT_CAP;
                 while end > 0 && !result.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -189,8 +194,8 @@ pub fn run_list_directory(workdir: &Path, path: &str, max_depth: usize) -> Strin
     let result = lines.join("\n");
     if result.is_empty() {
         "(empty directory)".into()
-    } else if result.len() > 50000 {
-        truncate_utf8(&result, 50000)
+    } else if result.len() > TOOL_RESULT_CAP {
+        truncate_utf8(&result, TOOL_RESULT_CAP)
     } else {
         result
     }
@@ -238,7 +243,15 @@ pub fn run_grep_search(workdir: &Path, pattern: &str, path: &str, include: &str)
 
     // Try rg first
     let mut cmd = Command::new("rg");
-    cmd.args(["--no-heading", "--line-number", "--color=never", "-m", "50"]);
+    cmd.args([
+        "--no-heading",
+        "--line-number",
+        "--color=never",
+        "--no-messages",
+        "--max-filesize=1M",
+        "-m",
+        "50",
+    ]);
     if !include.is_empty() {
         cmd.args(["-g", include]);
     }
@@ -247,37 +260,33 @@ pub fn run_grep_search(workdir: &Path, pattern: &str, path: &str, include: &str)
 
     match cmd.output() {
         Ok(output) => {
-            let out = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .trim()
-            .to_string();
+            // rg honors --no-messages so stderr is empty on partial-success.
+            // Drop stderr entirely; only return matched lines.
+            let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if out.is_empty() {
                 "(no matches)".into()
-            } else if out.len() > 50000 {
-                truncate_utf8(&out, 50000)
+            } else if out.len() > TOOL_RESULT_CAP {
+                truncate_utf8(&out, TOOL_RESULT_CAP)
             } else {
                 out
             }
         }
         Err(_) => {
-            // Fallback: grep on unix, PowerShell Select-String on Windows.
+            // Fallback: findstr on Windows (always available, immune to
+            // PowerShell ExecutionPolicy/AppLocker), grep on Unix.
             #[cfg(windows)]
             let mut cmd = {
-                let filter = if include.is_empty() { "*".to_string() } else { include.to_string() };
-                let target = search_path.to_string_lossy().replace('\'', "''");
-                let pat = pattern.replace('\'', "''");
-                let script = format!(
-                    "Get-ChildItem -Path '{}' -Recurse -File -Filter '{}' -ErrorAction SilentlyContinue | \
-                     Select-String -Pattern '{}' -ErrorAction SilentlyContinue | \
-                     Select-Object -First 50 | \
-                     ForEach-Object {{ \"$($_.Path):$($_.LineNumber):$($_.Line)\" }}",
-                    target, filter, pat
-                );
-                let mut c = Command::new("powershell");
-                c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+                let filter = if include.is_empty() {
+                    "*".to_string()
+                } else {
+                    include.to_string()
+                };
+                let target = search_path.join(filter);
+                let mut c = Command::new("findstr");
+                // /S recurse, /N line numbers, /R regex, /C: literal pattern arg
+                c.args(["/S", "/N", "/R"]);
+                c.arg(format!("/C:{}", pattern));
+                c.arg(target.to_string_lossy().as_ref());
                 c
             };
 
@@ -295,13 +304,7 @@ pub fn run_grep_search(workdir: &Path, pattern: &str, path: &str, include: &str)
             cmd.current_dir(workdir);
             match cmd.output() {
                 Ok(output) => {
-                    let out = format!(
-                        "{}{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    )
-                    .trim()
-                    .to_string();
+                    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     let lines: Vec<&str> = out.lines().take(50).collect();
                     if lines.is_empty() {
                         "(no matches)".into()
@@ -309,7 +312,19 @@ pub fn run_grep_search(workdir: &Path, pattern: &str, path: &str, include: &str)
                         lines.join("\n")
                     }
                 }
-                Err(e) => format!("Error: {}", e),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        || msg.contains("os error 5")
+                    {
+                        "Error: ripgrep (rg) not found and OS fallback could not start (access denied). Install ripgrep: https://github.com/BurntSushi/ripgrep".into()
+                    } else {
+                        format!(
+                            "Error: grep_search failed (rg unavailable, fallback errored): {}",
+                            e
+                        )
+                    }
+                }
             }
         }
     }
@@ -447,7 +462,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep_search",
-                "description": "Search for a regex pattern in files using ripgrep. Returns matching lines with file paths and line numbers.",
+                "description": "Search for a regex pattern in files using ripgrep. Returns matching lines with file paths and line numbers. Falls back to grep (Unix) or findstr (Windows, best-effort — regex dialect differs from rg) if ripgrep is unavailable.",
                 "parameters": {
                     "type": "object",
                     "properties": {

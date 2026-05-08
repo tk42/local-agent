@@ -127,7 +127,7 @@ async fn agent_loop(
         let sys_prompt = system_prompt(&workdir.display().to_string(), skills, in_plan);
 
         // Context management
-        context::maybe_compact(client, messages).await?;
+        context::maybe_compact(client, messages, client.config.context_tokens).await?;
 
         // Build messages with system prompt prepended
         let mut full_messages = vec![Message::system(&sys_prompt)];
@@ -281,16 +281,18 @@ fn print_help() {
     println!(
         r#"
 {bold}Local Agent - Commands{reset}
-  /compact   Force context compression
-  /todos     Show current todo list
-  /tokens    Show estimated token usage
-  /skills    List loaded skills
-  /plan      Toggle plan mode (alias for Shift+Tab)
-  /clear     Clear conversation history
-  /help      Show this help
-  q / exit   Quit
+  /compact         Force context compression
+  /todos           Show current todo list
+  /tokens          Show estimated token usage
+  /context [n]     Show or set context window (n_ctx, in tokens)
+  /maxtokens [n]   Show or set per-response output cap
+  /skills          List loaded skills
+  /plan            Toggle plan mode (alias for Shift+Tab)
+  /clear           Clear conversation history
+  /help            Show this help
+  q / exit         Quit
 
-  Shift+Tab  Toggle plan mode (read-only investigation; bash/write/edit blocked)
+  Shift+Tab        Toggle plan mode (read-only investigation; bash/write/edit blocked)
 "#,
         bold = "\x1b[1m",
         reset = "\x1b[0m"
@@ -305,7 +307,7 @@ fn make_prompt(plan_mode: &Arc<AtomicBool>) -> String {
     }
 }
 
-async fn repl(client: &LlmClient, skills: &SkillRegistry, workdir: &PathBuf) -> Result<()> {
+async fn repl(client: &mut LlmClient, skills: &SkillRegistry, workdir: &PathBuf) -> Result<()> {
     let mut history: Vec<Message> = Vec::new();
     let mut todo = TodoManager::new();
     let plan_mode = Arc::new(AtomicBool::new(false));
@@ -373,10 +375,58 @@ async fn repl(client: &LlmClient, skills: &SkillRegistry, workdir: &PathBuf) -> 
                 if stripped == "/tokens" {
                     let tokens = context::estimate_tokens(&history);
                     println!(
-                        "Estimated tokens: ~{} (threshold: {})",
+                        "Estimated tokens: ~{} (threshold: {}, n_ctx: {}, max_tokens: {})",
                         tokens,
-                        context::TOKEN_THRESHOLD
+                        context::token_threshold(client.config.context_tokens),
+                        client.config.context_tokens,
+                        client.config.max_tokens,
                     );
+                    continue;
+                }
+                if stripped.starts_with("/context") {
+                    let rest = line.trim().trim_start_matches("/context").trim();
+                    if rest.is_empty() {
+                        println!(
+                            "context_tokens={}, max_tokens={}, threshold={}",
+                            client.config.context_tokens,
+                            client.config.max_tokens,
+                            context::token_threshold(client.config.context_tokens),
+                        );
+                    } else {
+                        match rest.parse::<u32>() {
+                            Ok(n) if n >= 512 => {
+                                client.set_context_tokens(n);
+                                println!(
+                                    "[context: {} tok, max_tokens: {} tok, threshold: {}]",
+                                    client.config.context_tokens,
+                                    client.config.max_tokens,
+                                    context::token_threshold(client.config.context_tokens),
+                                );
+                            }
+                            _ => println!("Usage: /context [<n>]  (n must be a positive integer >= 512)"),
+                        }
+                    }
+                    continue;
+                }
+                if stripped.starts_with("/maxtokens") {
+                    let rest = line.trim().trim_start_matches("/maxtokens").trim();
+                    if rest.is_empty() {
+                        println!(
+                            "max_tokens={} (context_tokens={})",
+                            client.config.max_tokens, client.config.context_tokens
+                        );
+                    } else {
+                        match rest.parse::<u32>() {
+                            Ok(n) if n >= 64 => {
+                                client.set_max_tokens(n);
+                                println!(
+                                    "[max_tokens: {} tok (context_tokens: {})]",
+                                    client.config.max_tokens, client.config.context_tokens
+                                );
+                            }
+                            _ => println!("Usage: /maxtokens [<n>]  (n must be a positive integer >= 64)"),
+                        }
+                    }
                     continue;
                 }
                 if stripped == "/clear" {
@@ -436,7 +486,7 @@ async fn repl(client: &LlmClient, skills: &SkillRegistry, workdir: &PathBuf) -> 
 // ---------------------------------------------------------------------------
 
 async fn one_shot(
-    client: &LlmClient,
+    client: &mut LlmClient,
     skills: &SkillRegistry,
     query: &str,
     workdir: &PathBuf,
@@ -462,15 +512,15 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let config = LlmConfig::from_env();
-    let client = LlmClient::new(config);
+    let mut client = LlmClient::new(config);
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let skills = SkillRegistry::load();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        repl(&client, &skills, &workdir).await
+        repl(&mut client, &skills, &workdir).await
     } else {
         let query = args.join(" ");
-        one_shot(&client, &skills, &query, &workdir).await
+        one_shot(&mut client, &skills, &query, &workdir).await
     }
 }
