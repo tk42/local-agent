@@ -122,20 +122,23 @@ pub async fn auto_compact(client: &LlmClient, messages: &[Message]) -> Result<Ve
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
     eprintln!("\x1b[90m[context compressed → {}]\x1b[0m", filename);
 
-    Ok(vec![
-        Message::user(&format!(
-            "[Context compressed. Transcript saved to {}]\n\n{}",
-            path.display(),
-            summary
-        )),
-        Message::assistant(
-            Some("Understood. Continuing with the summarized context.".into()),
-            None,
-        ),
-    ])
+    // Return a single user message — no trailing assistant turn.
+    // llama-server's chat templates interpret a trailing assistant message as a
+    // prefill request, which is rejected by thinking-enabled models (Qwen3 etc.)
+    // with `Assistant response prefill is incompatible with enable_thinking`.
+    Ok(vec![Message::user(&format!(
+        "[Context compressed. Transcript saved to {}]\n\n{}",
+        path.display(),
+        summary
+    ))])
 }
 
 /// Run microcompact always; run auto_compact if over threshold. Returns messages.
+///
+/// If `auto_compact` fails (e.g. the summarize call to llama-server times out),
+/// we keep the conversation alive by re-running microcompact in aggressive mode
+/// rather than propagating the error up — the user can keep talking, and the
+/// older tool results are cleared to free space for the next turn.
 pub async fn maybe_compact(
     client: &LlmClient,
     messages: &mut Vec<Message>,
@@ -146,8 +149,16 @@ pub async fn maybe_compact(
     microcompact(messages, est > threshold * 8 / 10);
     if estimate_tokens(messages) > threshold {
         eprintln!("\x1b[90m[auto-compact triggered]\x1b[0m");
-        let new_messages = auto_compact(client, messages).await?;
-        *messages = new_messages;
+        match auto_compact(client, messages).await {
+            Ok(new_messages) => *messages = new_messages,
+            Err(e) => {
+                eprintln!(
+                    "\x1b[33m[warn] auto-compact failed: {} — falling back to aggressive microcompact\x1b[0m",
+                    e
+                );
+                microcompact(messages, true);
+            }
+        }
     }
     Ok(())
 }

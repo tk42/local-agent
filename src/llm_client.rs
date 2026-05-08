@@ -237,6 +237,13 @@ impl LlmClient {
     }
 
     /// Non-streaming summary used by context compression.
+    ///
+    /// Overrides the shared client's 120s timeout with a per-request 600s budget:
+    /// summarize sends ~80KB of conversation as a single prompt and asks for up
+    /// to 2000 output tokens, which on slower local GPUs / CPU inference can
+    /// genuinely take 2-5 minutes. We also retry once on transport failure
+    /// (timeout, reset connection) before giving up — `maybe_compact` falls back
+    /// to aggressive microcompact when this still errors.
     pub async fn summarize(&self, text: &str, max_tokens: u32) -> Result<String> {
         let body = serde_json::json!({
             "model": self.config.model,
@@ -249,23 +256,53 @@ impl LlmClient {
             "stream": false,
         });
         let url = format!("{}/chat/completions", self.config.base_url);
-        let resp: Value = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow!("summarize send: {}", describe_error_chain(&e)))?
-            .error_for_status()
-            .map_err(|e| anyhow!("summarize status: {}", describe_error_chain(&e)))?
-            .json()
-            .await
-            .map_err(|e| anyhow!("summarize decode: {}", describe_error_chain(&e)))?;
-        Ok(resp["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("(empty summary)")
-            .to_string())
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..2u32 {
+            let send_result = self
+                .http
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(600))
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .json(&body)
+                .send()
+                .await;
+            match send_result {
+                Ok(resp) => {
+                    let resp = match resp.error_for_status() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "summarize status: {}",
+                                describe_error_chain(&e)
+                            ));
+                        }
+                    };
+                    let parsed: Value = resp
+                        .json()
+                        .await
+                        .map_err(|e| anyhow!("summarize decode: {}", describe_error_chain(&e)))?;
+                    return Ok(parsed["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap_or("(empty summary)")
+                        .to_string());
+                }
+                Err(e) => {
+                    let chain = describe_error_chain(&e);
+                    if attempt == 0 {
+                        eprintln!(
+                            "\x1b[33m[warn] summarize attempt 1 failed ({}); retrying once...\x1b[0m",
+                            chain
+                        );
+                        last_err = Some(anyhow!("summarize send: {}", chain));
+                        continue;
+                    }
+                    last_err = Some(anyhow!("summarize send: {}", chain));
+                    break;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("summarize: unknown error")))
     }
 
     async fn stream_chat(&self, body: &Value) -> Result<ChatResult> {
