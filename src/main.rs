@@ -19,6 +19,7 @@ mod context;
 mod llm_client;
 mod skills;
 mod todo_manager;
+mod tool_call_stream;
 mod tools;
 
 use std::path::PathBuf;
@@ -29,7 +30,7 @@ use anyhow::Result;
 use rustyline::{Cmd, ConditionalEventHandler, Event, EventContext, EventHandler, KeyCode, KeyEvent, Modifiers, RepeatCount};
 use serde_json::Value;
 
-use llm_client::{LlmClient, LlmConfig, Message, MessageToolCall, FunctionCall};
+use llm_client::{LlmClient, LlmConfig, Message, MessageToolCall, FunctionCallSerde};
 use skills::{SkillRegistry, handle_load_skill};
 use todo_manager::{TodoManager, handle_todo_write, todo_tool_definition};
 
@@ -62,13 +63,23 @@ impl ConditionalEventHandler for PlanModeToggler {
 // ---------------------------------------------------------------------------
 
 fn system_prompt(workdir: &str, skills: &SkillRegistry, plan_mode: bool) -> String {
+    let os = std::env::consts::OS;
+    let shell_hint = if cfg!(windows) {
+        "Windows cmd.exe (NOT bash). Use Windows-style paths (C:\\foo\\bar) and cmd syntax. \
+         Do NOT use bash-isms like '&&' chaining beyond cmd's support, '2>/dev/null', backticks, or POSIX globs. \
+         For redirection use '> NUL 2>&1'. For pipelines use '|'. The 'bash' tool actually invokes cmd /C on this OS."
+    } else {
+        "POSIX sh. Use forward-slash paths and standard sh syntax."
+    };
     let mut out = format!(
-        r#"You are an expert coding agent working in: {}
+        r#"You are an expert coding agent working in: {workdir}
+Operating system: {os}
+Shell environment: {shell_hint}
 
 Your capabilities:
-- Execute shell commands (bash)
+- Execute shell commands (bash tool — note: maps to cmd.exe on Windows)
 - Read, write, and edit files
-- Search code with grep
+- Search code with grep_search (uses ripgrep, falls back to PowerShell Select-String on Windows)
 - List directory contents
 - Track tasks with todo_write
 
@@ -78,8 +89,11 @@ Rules:
 3. For multi-step tasks, use todo_write to track progress.
 4. Prefer small, targeted edits over full file rewrites.
 5. Verify your changes work (e.g., run tests, check syntax).
-6. Be concise in your responses. Show results, not explanations."#,
-        workdir
+6. Be concise in your responses. Show results, not explanations.
+7. Match shell syntax to the OS above. Do not invent paths from other operating systems."#,
+        workdir = workdir,
+        os = os,
+        shell_hint = shell_hint
     );
     if let Some(section) = skills.system_prompt_section() {
         out.push_str(&section);
@@ -122,24 +136,40 @@ async fn agent_loop(
         // LLM call
         let result = client.chat(&full_messages, Some(all_tools)).await?;
 
-        // Build assistant message
+        // Surface non-stop finish reasons so the user knows why a turn ended early.
+        match result.finish_reason.as_str() {
+            "stop" | "tool_calls" | "" => {}
+            "length" => eprintln!(
+                "\x1b[33m[warn] response truncated by max_tokens limit (LLM_MAX_TOKENS={})\x1b[0m",
+                client.config.max_tokens
+            ),
+            "content_filter" => eprintln!(
+                "\x1b[33m[warn] response stopped by content filter\x1b[0m"
+            ),
+            other => eprintln!(
+                "\x1b[33m[warn] unexpected finish_reason: {}\x1b[0m",
+                other
+            ),
+        }
+
+        // Build assistant message. Always send `arguments` as a valid JSON string
+        // (re-serialize the parsed Value), and always send `content` as a string
+        // — `null` content with tool_calls breaks some llama-server jinja templates.
         let msg_tool_calls = result.tool_calls.as_ref().map(|tcs| {
             tcs.iter()
                 .map(|tc| MessageToolCall {
                     id: tc.id.clone(),
                     call_type: "function".into(),
-                    function: FunctionCall {
+                    function: FunctionCallSerde {
                         name: tc.name.clone(),
-                        arguments: tc.arguments_raw.clone(),
+                        arguments: serde_json::to_string(&tc.arguments)
+                            .unwrap_or_else(|_| "{}".into()),
                     },
                 })
                 .collect()
         });
 
-        let content_for_msg = match (&result.content, &msg_tool_calls) {
-            (None, None) => Some(String::new()),
-            _ => result.content.clone(),
-        };
+        let content_for_msg = Some(result.content.clone().unwrap_or_default());
         messages.push(Message::assistant(content_for_msg, msg_tool_calls));
 
         // No tool calls → done
@@ -169,11 +199,16 @@ async fn agent_loop(
                 println!("\x1b[90m> {}({})\x1b[0m", name, arg_summary);
             }
 
-            // Execute (gate destructive tools while plan mode is on)
+            // Execute (gate destructive tools while plan mode is on).
+            // Phrase the block message as system-side feedback so small models
+            // are less likely to "argue" with it via re-tries.
             let output = if in_plan && PLAN_BLOCKED_TOOLS.contains(&name.as_str()) {
                 println!("\x1b[31m[blocked: plan mode]\x1b[0m");
                 format!(
-                    "Error: tool '{}' is blocked while plan mode is active. Toggle off with Shift+Tab or /plan to execute.",
+                    "[system] Plan mode is active. The '{}' tool is unavailable in this mode. \
+                     Do not retry — instead, finish your investigation using read-only tools and \
+                     output a Markdown plan. The user will toggle plan mode off (Shift+Tab or /plan) \
+                     to execute when they approve the plan.",
                     name
                 )
             } else if name == "todo_write" {
@@ -190,7 +225,11 @@ async fn agent_loop(
                 println!("\x1b[90m{}\x1b[0m", output);
             } else {
                 let preview = if output.len() > 500 {
-                    format!("{}\n... ({} chars total)", &output[..500], output.len())
+                    let mut end = 500;
+                    while end > 0 && !output.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}\n... ({} chars total)", &output[..end], output.len())
                 } else {
                     output.clone()
                 };
@@ -218,7 +257,11 @@ fn format_args_summary(args: &Value) -> String {
             .map(|(k, v)| {
                 let repr = format!("{}", v);
                 let truncated = if repr.len() > 60 {
-                    format!("{}...", &repr[..60])
+                    let mut end = 60;
+                    while end > 0 && !repr.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &repr[..end])
                 } else {
                     repr
                 };

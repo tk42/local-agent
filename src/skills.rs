@@ -68,7 +68,8 @@ impl SkillRegistry {
                             "enum": names,
                         }
                     },
-                    "required": ["name"]
+                    "required": ["name"],
+                    "additionalProperties": false
                 }
             }
         }))

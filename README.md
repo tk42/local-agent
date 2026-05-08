@@ -7,7 +7,7 @@
 ## 前提条件
 
 - Rust 1.85+ (ビルドのみ。実行にはランタイム不要)
-- llama-server が `--jinja` 付きで起動済み (tool calling に必要)
+- **llama-server を `--jinja` 付きで起動 (必須)** — tool calling は OpenAI 互換のストリーム上で `tool_calls` 構造として返されることを前提にしています。`--jinja` 無しで Hermes/Qwen テンプレートが `<tool_call>...</tool_call>` をプレーンテキストとして垂れ流す挙動は本クライアント側で救済しません (旧 B5 フォールバックは v0.2 で削除されました)。
 - ripgrep (`rg`) がインストール済み (grep_search ツール用、なければ grep にフォールバック)
 
 ## ビルド

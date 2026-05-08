@@ -31,23 +31,51 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
 
 /// Clear old tool result content to save space.
 /// Keeps only the 3 most recent tool results intact.
+///
+/// Also clears the matching assistant tool_call.arguments (by id) so we don't
+/// keep paying for huge argument blobs when the corresponding result is gone.
+/// IDs are preserved on both sides — that integrity is what OpenAI-compatible
+/// servers validate.
 pub fn microcompact(messages: &mut [Message]) {
-    let tool_indices: Vec<usize> = messages
+    let tool_pairs: Vec<(usize, String)> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == "tool")
-        .map(|(i, _)| i)
+        .filter_map(|(i, m)| {
+            if m.role == "tool" {
+                m.tool_call_id.clone().map(|id| (i, id))
+            } else {
+                None
+            }
+        })
         .collect();
 
-    if tool_indices.len() <= 3 {
+    if tool_pairs.len() <= 3 {
         return;
     }
 
-    let to_clear = &tool_indices[..tool_indices.len() - 3];
-    for &idx in to_clear {
-        if let Some(ref content) = messages[idx].content {
+    let cutoff = tool_pairs.len() - 3;
+    let ids_to_clear: std::collections::HashSet<String> = tool_pairs[..cutoff]
+        .iter()
+        .map(|(_, id)| id.clone())
+        .collect();
+
+    for (idx, _) in &tool_pairs[..cutoff] {
+        if let Some(ref content) = messages[*idx].content {
             if content.len() > 200 {
-                messages[idx].content = Some("[cleared]".into());
+                messages[*idx].content = Some("[cleared]".into());
+            }
+        }
+    }
+
+    for msg in messages.iter_mut() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        if let Some(ref mut tcs) = msg.tool_calls {
+            for tc in tcs.iter_mut() {
+                if ids_to_clear.contains(&tc.id) && tc.function.arguments.len() > 200 {
+                    tc.function.arguments = "{}".into();
+                }
             }
         }
     }
@@ -74,7 +102,11 @@ pub async fn auto_compact(client: &LlmClient, messages: &[Message]) -> Result<Ve
 
     let conv_text = serde_json::to_string(messages).unwrap_or_default();
     let truncated = if conv_text.len() > 80_000 {
-        &conv_text[..80_000]
+        let mut end = 80_000;
+        while end > 0 && !conv_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &conv_text[..end]
     } else {
         &conv_text
     };

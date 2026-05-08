@@ -10,6 +10,19 @@ use std::process::Command;
 
 use serde_json::Value;
 
+/// Truncate a string to at most `max` bytes, but never split a UTF-8
+/// codepoint. Returns an owned String for ergonomic use in formatters.
+fn truncate_utf8(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Path safety
 // ---------------------------------------------------------------------------
@@ -49,12 +62,22 @@ pub fn run_bash(workdir: &Path, command: &str) -> String {
     if dangerous.iter().any(|d| command.contains(d)) {
         return "Error: Dangerous command blocked".into();
     }
-    match Command::new("sh")
+
+    #[cfg(windows)]
+    let result = Command::new("cmd")
+        .arg("/C")
+        .arg(command)
+        .current_dir(workdir)
+        .output();
+
+    #[cfg(not(windows))]
+    let result = Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(workdir)
-        .output()
-    {
+        .output();
+
+    match result {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -62,7 +85,7 @@ pub fn run_bash(workdir: &Path, command: &str) -> String {
             if out.is_empty() {
                 "(no output)".into()
             } else if out.len() > 50000 {
-                out[..50000].to_string()
+                truncate_utf8(&out, 50000)
             } else {
                 out
             }
@@ -94,7 +117,11 @@ pub fn run_read_file(workdir: &Path, path: &str, offset: usize, limit: usize) ->
                 .collect();
             let mut result = numbered.join("\n");
             if result.len() > 50000 {
-                result.truncate(50000);
+                let mut end = 50000;
+                while end > 0 && !result.is_char_boundary(end) {
+                    end -= 1;
+                }
+                result.truncate(end);
                 result.push_str("\n... (truncated)");
             }
             if total > selected.len() {
@@ -163,7 +190,7 @@ pub fn run_list_directory(workdir: &Path, path: &str, max_depth: usize) -> Strin
     if result.is_empty() {
         "(empty directory)".into()
     } else if result.len() > 50000 {
-        result[..50000].to_string()
+        truncate_utf8(&result, 50000)
     } else {
         result
     }
@@ -230,19 +257,41 @@ pub fn run_grep_search(workdir: &Path, pattern: &str, path: &str, include: &str)
             if out.is_empty() {
                 "(no matches)".into()
             } else if out.len() > 50000 {
-                out[..50000].to_string()
+                truncate_utf8(&out, 50000)
             } else {
                 out
             }
         }
         Err(_) => {
-            // Fallback to grep
-            let mut cmd = Command::new("grep");
-            cmd.args(["-rn", "--color=never"]);
-            if !include.is_empty() {
-                cmd.args(["--include", include]);
-            }
-            cmd.arg(pattern).arg(search_path.to_string_lossy().as_ref());
+            // Fallback: grep on unix, PowerShell Select-String on Windows.
+            #[cfg(windows)]
+            let mut cmd = {
+                let filter = if include.is_empty() { "*".to_string() } else { include.to_string() };
+                let target = search_path.to_string_lossy().replace('\'', "''");
+                let pat = pattern.replace('\'', "''");
+                let script = format!(
+                    "Get-ChildItem -Path '{}' -Recurse -File -Filter '{}' -ErrorAction SilentlyContinue | \
+                     Select-String -Pattern '{}' -ErrorAction SilentlyContinue | \
+                     Select-Object -First 50 | \
+                     ForEach-Object {{ \"$($_.Path):$($_.LineNumber):$($_.Line)\" }}",
+                    target, filter, pat
+                );
+                let mut c = Command::new("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+                c
+            };
+
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut c = Command::new("grep");
+                c.args(["-rn", "--color=never"]);
+                if !include.is_empty() {
+                    c.args(["--include", include]);
+                }
+                c.arg(pattern).arg(search_path.to_string_lossy().as_ref());
+                c
+            };
+
             cmd.current_dir(workdir);
             match cmd.output() {
                 Ok(output) => {
@@ -324,7 +373,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "properties": {
                         "command": {"type": "string", "description": "The shell command to execute."}
                     },
-                    "required": ["command"]
+                    "required": ["command"],
+                    "additionalProperties": false
                 }
             }
         },
@@ -340,7 +390,8 @@ pub fn tool_definitions() -> Vec<Value> {
                         "offset": {"type": "integer", "description": "1-indexed start line (optional)."},
                         "limit":  {"type": "integer", "description": "Max lines to read (optional)."}
                     },
-                    "required": ["path"]
+                    "required": ["path"],
+                    "additionalProperties": false
                 }
             }
         },
@@ -355,7 +406,8 @@ pub fn tool_definitions() -> Vec<Value> {
                         "path":    {"type": "string", "description": "File path (relative to workspace root)."},
                         "content": {"type": "string", "description": "Full file content to write."}
                     },
-                    "required": ["path", "content"]
+                    "required": ["path", "content"],
+                    "additionalProperties": false
                 }
             }
         },
@@ -371,7 +423,8 @@ pub fn tool_definitions() -> Vec<Value> {
                         "old_text": {"type": "string", "description": "Exact text to find (must match)."},
                         "new_text": {"type": "string", "description": "Replacement text."}
                     },
-                    "required": ["path", "old_text", "new_text"]
+                    "required": ["path", "old_text", "new_text"],
+                    "additionalProperties": false
                 }
             }
         },
@@ -385,7 +438,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "properties": {
                         "path":      {"type": "string", "description": "Directory path (default: workspace root)."},
                         "max_depth": {"type": "integer", "description": "Max depth to traverse (default: 2)."}
-                    }
+                    },
+                    "additionalProperties": false
                 }
             }
         },
@@ -401,7 +455,8 @@ pub fn tool_definitions() -> Vec<Value> {
                         "path":    {"type": "string", "description": "Directory or file to search in (default: workspace root)."},
                         "include": {"type": "string", "description": "Glob filter, e.g. '*.py' (optional)."}
                     },
-                    "required": ["pattern"]
+                    "required": ["pattern"],
+                    "additionalProperties": false
                 }
             }
         }

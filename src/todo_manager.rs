@@ -134,11 +134,13 @@ pub fn todo_tool_definition() -> Value {
                                     "description": "Task status."
                                 }
                             },
-                            "required": ["content", "status"]
+                            "required": ["content", "status"],
+                            "additionalProperties": false
                         }
                     }
                 },
-                "required": ["items"]
+                "required": ["items"],
+                "additionalProperties": false
             }
         }
     })

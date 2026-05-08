@@ -1,21 +1,37 @@
 ///
-/// llm_client.rs - OpenAI SDK wrapper for llama-server
+/// llm_client.rs - Thin wrapper over async-openai for llama-server / OpenAI-
+/// compatible servers.
 ///
-/// Connects to a local llama-server (or any OpenAI-compatible endpoint)
-/// via reqwest. Handles tool-calling response parsing and SSE streaming.
+/// We keep our own flat `Message` struct for transcript output and history
+/// management, and convert to/from async-openai's typed enums at the API
+/// boundary. async-openai owns the HTTP client, SSE parsing, and request
+/// shaping; we own retries and tool_call aggregation.
 ///
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use anyhow::{bail, Result};
+use async_openai::{
+    config::OpenAIConfig,
+    error::OpenAIError,
+    types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
+        ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionTools,
+        CreateChatCompletionRequestArgs, FunctionCall,
+    },
+    Client,
+};
 use futures_util::StreamExt;
-use reqwest::Client;
-use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::tool_call_stream::StreamingToolCallAccumulator;
+
 // ---------------------------------------------------------------------------
-// Types
+// Public types — kept stable so the rest of the crate is unaffected.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,25 +84,23 @@ pub struct MessageToolCall {
     pub id: String,
     #[serde(rename = "type")]
     pub call_type: String,
-    pub function: FunctionCall,
+    pub function: FunctionCallSerde,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
+pub struct FunctionCallSerde {
     pub name: String,
     pub arguments: String,
 }
 
-/// Parsed tool call (after JSON decode)
+/// Parsed tool call (after JSON decode of arguments)
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
-    pub arguments_raw: String,
 }
 
-/// Result from a chat completion
 #[derive(Debug)]
 pub struct ChatResult {
     pub content: Option<String>,
@@ -134,43 +148,32 @@ impl LlmConfig {
 
 pub struct LlmClient {
     pub config: LlmConfig,
-    http: Client,
+    inner: Client<OpenAIConfig>,
 }
 
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
-        Self {
-            config,
-            http: Client::new(),
-        }
+        let oai_cfg = OpenAIConfig::new()
+            .with_api_base(config.base_url.clone())
+            .with_api_key(config.api_key.clone());
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let inner = Client::with_config(oai_cfg).with_http_client(http);
+        Self { config, inner }
     }
 
-    /// Send a chat completion request with streaming.
-    pub async fn chat(
-        &self,
-        messages: &[Message],
-        tools: Option<&[Value]>,
-    ) -> Result<ChatResult> {
-        let mut body = serde_json::json!({
-            "model": self.config.model,
-            "messages": messages,
-            "max_tokens": self.config.max_tokens,
-            "temperature": self.config.temperature,
-            "stream": true,
-        });
-
-        if let Some(tools) = tools {
-            if !tools.is_empty() {
-                body["tools"] = Value::Array(tools.to_vec());
-                body["tool_choice"] = Value::String("auto".into());
-            }
-        }
-
+    /// Streaming chat completion with tool support.
+    pub async fn chat(&self, messages: &[Message], tools: Option<&[Value]>) -> Result<ChatResult> {
         for attempt in 0..3u32 {
-            match self.stream_chat(&body).await {
+            match self.stream_chat(messages, tools).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    if is_connection_error(&e) {
+                    if is_connect_error(&e) {
                         die_connection_error(&self.config.base_url);
                     }
                     if attempt < 2 {
@@ -185,150 +188,119 @@ impl LlmClient {
         unreachable!()
     }
 
-    /// Summarize text for context compression.
+    /// Non-streaming summary used by context compression.
     pub async fn summarize(&self, text: &str, max_tokens: u32) -> Result<String> {
-        let body = serde_json::json!({
-            "model": self.config.model,
-            "messages": [
-                {"role": "user", "content": format!("Summarize the following conversation for continuity:\n\n{}", text)}
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-            "stream": false,
-        });
+        let user_msg: ChatCompletionRequestMessage = ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(format!(
+                "Summarize the following conversation for continuity:\n\n{}",
+                text
+            )),
+            name: None,
+        }
+        .into();
 
-        let url = format!("{}/chat/completions", self.config.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .json(&body)
-            .send()
-            .await?
-            .json::<Value>()
-            .await?;
+        let req = CreateChatCompletionRequestArgs::default()
+            .model(self.config.model.clone())
+            .messages(vec![user_msg])
+            .max_tokens(max_tokens)
+            .temperature(0.3_f32)
+            .build()?;
 
-        let content = resp["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("(empty summary)");
-        Ok(content.to_string())
+        let resp = self.inner.chat().create(req).await?;
+        let content = resp
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+            .unwrap_or_else(|| "(empty summary)".to_string());
+        Ok(content)
     }
 
-    async fn stream_chat(&self, body: &Value) -> Result<ChatResult> {
-        let url = format!("{}/chat/completions", self.config.base_url);
+    async fn stream_chat(
+        &self,
+        messages: &[Message],
+        tools: Option<&[Value]>,
+    ) -> Result<ChatResult> {
+        let oai_messages = messages
+            .iter()
+            .map(to_openai_message)
+            .collect::<Result<Vec<_>>>()?;
 
-        let request = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_string(body)?);
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder
+            .model(self.config.model.clone())
+            .messages(oai_messages)
+            .max_tokens(self.config.max_tokens)
+            .temperature(self.config.temperature as f32);
 
-        let mut es = EventSource::new(request)?;
+        if let Some(tool_values) = tools {
+            if !tool_values.is_empty() {
+                let tool_objs: Vec<ChatCompletionTools> = tool_values
+                    .iter()
+                    .map(|v| serde_json::from_value::<ChatCompletionTool>(v.clone()).map(ChatCompletionTools::Function))
+                    .collect::<Result<_, _>>()?;
+                builder.tools(tool_objs);
+            }
+        }
 
-        let mut content_parts: Vec<String> = Vec::new();
-        let mut tool_calls_acc: BTreeMap<u64, ToolCallAcc> = BTreeMap::new();
+        let request = builder.build()?;
+
+        let mut stream = self.inner.chat().create_stream(request).await?;
+
+        let mut content_buffer = String::new();
+        let mut acc = StreamingToolCallAccumulator::new();
+        let mut tool_calls_started = false;
+        let mut printed_anything = false;
         let mut finish_reason = String::from("stop");
 
-        while let Some(event) = es.next().await {
-            match event {
-                Ok(Event::Open) => {}
-                Ok(Event::Message(msg)) => {
-                    if msg.data == "[DONE]" {
-                        break;
-                    }
-                    let chunk: Value = match serde_json::from_str(&msg.data) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+        while let Some(item) = stream.next().await {
+            let response = item?;
+            for choice in &response.choices {
+                if let Some(fr) = choice.finish_reason {
+                    finish_reason = format!("{:?}", fr).to_lowercase();
+                    // Debug repr is e.g. "Stop", "ToolCalls", "Length", "ContentFilter".
+                    // Normalize to OpenAI wire spec.
+                    finish_reason = match finish_reason.as_str() {
+                        "stop" => "stop".into(),
+                        "toolcalls" => "tool_calls".into(),
+                        "length" => "length".into(),
+                        "contentfilter" => "content_filter".into(),
+                        "functioncall" => "function_call".into(),
+                        other => other.to_string(),
                     };
+                }
 
-                    let choices = match chunk["choices"].as_array() {
-                        Some(c) => c,
-                        None => continue,
-                    };
-                    if choices.is_empty() {
-                        continue;
-                    }
-
-                    let choice = &choices[0];
-                    if let Some(fr) = choice["finish_reason"].as_str() {
-                        finish_reason = fr.to_string();
-                    }
-
-                    let delta = &choice["delta"];
-
-                    // Text content
-                    if let Some(text) = delta["content"].as_str() {
-                        print!("{}", text);
-                        io::stdout().flush().ok();
-                        content_parts.push(text.to_string());
-                    }
-
-                    // Tool calls (streamed incrementally)
-                    if let Some(tcs) = delta["tool_calls"].as_array() {
-                        for tc in tcs {
-                            let idx = tc["index"].as_u64().unwrap_or(0);
-                            let entry = tool_calls_acc.entry(idx).or_insert_with(|| ToolCallAcc {
-                                id: String::new(),
-                                name: String::new(),
-                                arguments: String::new(),
-                            });
-                            if let Some(id) = tc["id"].as_str() {
-                                if !id.is_empty() {
-                                    entry.id = id.to_string();
-                                }
-                            }
-                            if let Some(name) = tc["function"]["name"].as_str() {
-                                if !name.is_empty() {
-                                    entry.name = name.to_string();
-                                }
-                            }
-                            if let Some(args) = tc["function"]["arguments"].as_str() {
-                                entry.arguments.push_str(args);
-                            }
+                if let Some(text) = &choice.delta.content {
+                    if !text.is_empty() {
+                        content_buffer.push_str(text);
+                        if !tool_calls_started {
+                            print!("{}", text);
+                            io::stdout().flush().ok();
+                            printed_anything = true;
                         }
                     }
                 }
-                Err(reqwest_eventsource::Error::StreamEnded) => break,
-                Err(e) => {
-                    bail!("SSE stream error: {}", e);
+
+                if let Some(tcs) = &choice.delta.tool_calls {
+                    for tc in tcs {
+                        let name = tc.function.as_ref().and_then(|f| f.name.as_deref());
+                        let args = tc.function.as_ref().and_then(|f| f.arguments.as_deref());
+                        acc.ingest(tc.index, tc.id.as_deref(), name, args);
+                    }
+                    tool_calls_started = true;
                 }
             }
         }
-        es.close();
 
-        // Newline after streamed text
-        if !content_parts.is_empty() {
+        if printed_anything {
             println!();
         }
 
-        let content = if content_parts.is_empty() {
+        let content = if content_buffer.is_empty() {
             None
         } else {
-            Some(content_parts.join(""))
+            Some(content_buffer)
         };
-
-        let tool_calls = if tool_calls_acc.is_empty() {
-            None
-        } else {
-            let mut parsed = Vec::new();
-            for (_idx, acc) in &tool_calls_acc {
-                let arguments: Value = if acc.arguments.is_empty() {
-                    Value::Object(serde_json::Map::new())
-                } else {
-                    serde_json::from_str(&acc.arguments).unwrap_or_else(|_| {
-                        serde_json::json!({"_raw": acc.arguments})
-                    })
-                };
-                parsed.push(ParsedToolCall {
-                    id: acc.id.clone(),
-                    name: acc.name.clone(),
-                    arguments,
-                    arguments_raw: acc.arguments.clone(),
-                });
-            }
-            Some(parsed)
-        };
+        let tool_calls = acc.finalize();
 
         Ok(ChatResult {
             content,
@@ -338,15 +310,89 @@ impl LlmClient {
     }
 }
 
-struct ToolCallAcc {
-    id: String,
-    name: String,
-    arguments: String,
+// ---------------------------------------------------------------------------
+// Conversion: our flat Message → async-openai's typed enum
+// ---------------------------------------------------------------------------
+
+fn to_openai_message(msg: &Message) -> Result<ChatCompletionRequestMessage> {
+    match msg.role.as_str() {
+        "system" => Ok(ChatCompletionRequestSystemMessage {
+            content: ChatCompletionRequestSystemMessageContent::Text(
+                msg.content.clone().unwrap_or_default(),
+            ),
+            name: None,
+        }
+        .into()),
+        "user" => Ok(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(
+                msg.content.clone().unwrap_or_default(),
+            ),
+            name: None,
+        }
+        .into()),
+        "assistant" => {
+            let tool_calls: Option<Vec<ChatCompletionMessageToolCalls>> =
+                msg.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter()
+                        .map(|tc| {
+                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                                id: tc.id.clone(),
+                                function: FunctionCall {
+                                    name: tc.function.name.clone(),
+                                    arguments: tc.function.arguments.clone(),
+                                },
+                            })
+                        })
+                        .collect()
+                });
+            #[allow(deprecated)]
+            let assistant_msg = ChatCompletionRequestAssistantMessage {
+                content: Some(ChatCompletionRequestAssistantMessageContent::Text(
+                    msg.content.clone().unwrap_or_default(),
+                )),
+                refusal: None,
+                name: None,
+                audio: None,
+                tool_calls,
+                function_call: None,
+            };
+            Ok(assistant_msg.into())
+        }
+        "tool" => Ok(ChatCompletionRequestToolMessage {
+            content: ChatCompletionRequestToolMessageContent::Text(
+                msg.content.clone().unwrap_or_default(),
+            ),
+            tool_call_id: msg.tool_call_id.clone().unwrap_or_default(),
+        }
+        .into()),
+        other => bail!("unsupported message role: {}", other),
+    }
 }
 
-fn is_connection_error(e: &anyhow::Error) -> bool {
-    let s = format!("{:?}", e);
-    s.contains("Connection") || s.contains("ConnectError")
+// ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
+
+/// Hard connection failure (DNS, refused, etc). For these, retrying with the
+/// same body never helps, so we surface immediately.
+fn is_connect_error(e: &anyhow::Error) -> bool {
+    let mut cur: Option<&dyn std::error::Error> = Some(e.as_ref());
+    while let Some(err) = cur {
+        if let Some(oai) = err.downcast_ref::<OpenAIError>() {
+            if let OpenAIError::Reqwest(re) = oai {
+                if re.is_connect() {
+                    return true;
+                }
+            }
+        }
+        if let Some(re) = err.downcast_ref::<reqwest::Error>() {
+            if re.is_connect() {
+                return true;
+            }
+        }
+        cur = err.source();
+    }
+    false
 }
 
 fn die_connection_error(base_url: &str) -> ! {
