@@ -1,8 +1,8 @@
 ///
 /// tool_call_stream.rs - Aggregator for streamed tool_calls
 ///
-/// async-openai delivers each tool_call fragment as a `ChatCompletionMessageToolCallChunk`
-/// with an explicit `index`. We trust that index and grow a Vec slot-by-slot.
+/// The OpenAI streaming spec delivers each tool_call fragment with an explicit
+/// `index`. We trust that index and grow a Vec slot-by-slot.
 ///
 /// We do NOT support id-based fallback, "neither index nor id" recovery, or
 /// Hermes/Qwen `<tool_call>` tag extraction. If a server doesn't follow the
