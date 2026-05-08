@@ -249,6 +249,7 @@ pub fn run_grep_search(workdir: &Path, pattern: &str, path: &str, include: &str)
         "--color=never",
         "--no-messages",
         "--max-filesize=1M",
+        "--max-columns=300",
         "-m",
         "50",
     ]);

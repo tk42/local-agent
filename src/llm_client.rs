@@ -170,9 +170,16 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
+        // Disable HTTP keep-alive pool: when llama-server times out or resets a
+        // connection (e.g. after an oversized prompt), the next request would
+        // otherwise pick up the dead connection from the pool and fail with
+        // `error sending request` even for a tiny prompt. Forcing a fresh TCP
+        // connection per request costs ~10µs over loopback and makes recovery
+        // automatic.
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { config, http }
