@@ -253,7 +253,19 @@ impl LlmClient {
         let mut finish_reason = String::from("stop");
 
         while let Some(item) = stream.next().await {
-            let response = item?;
+            let response = match item {
+                Ok(r) => r,
+                // Upstream bug in async-openai 0.38: the SSE [DONE] terminator
+                // is fed through the default deserializer and surfaces as a
+                // JSONDeserialize error before the inner `done` flag breaks
+                // the loop. Treat it as end-of-stream.
+                Err(OpenAIError::JSONDeserialize(_, content))
+                    if content.trim() == "[DONE]" =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            };
             for choice in &response.choices {
                 if let Some(fr) = choice.finish_reason {
                     finish_reason = format!("{:?}", fr).to_lowercase();
