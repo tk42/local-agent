@@ -136,7 +136,11 @@ async fn agent_loop(
                 .collect()
         });
 
-        messages.push(Message::assistant(result.content.clone(), msg_tool_calls));
+        let content_for_msg = match (&result.content, &msg_tool_calls) {
+            (None, None) => Some(String::new()),
+            _ => result.content.clone(),
+        };
+        messages.push(Message::assistant(content_for_msg, msg_tool_calls));
 
         // No tool calls → done
         let tool_calls = match result.tool_calls {
