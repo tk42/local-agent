@@ -286,6 +286,7 @@ fn print_help() {
   /tokens          Show estimated token usage
   /context [n]     Show or set context window (n_ctx, in tokens)
   /maxtokens [n]   Show or set per-response output cap
+  /ping            Test connectivity to the LLM server
   /skills          List loaded skills
   /plan            Toggle plan mode (alias for Shift+Tab)
   /clear           Clear conversation history
@@ -331,6 +332,18 @@ async fn repl(client: &mut LlmClient, skills: &SkillRegistry, workdir: &PathBuf)
     }
     println!("Type /help for commands, q to quit. Shift+Tab toggles plan mode.\n");
 
+    // Surface server unreachability before the user sends their first prompt.
+    // Stays silent on success.
+    if let Err(e) = client.ping().await {
+        eprintln!(
+            "\x1b[33m[warn] LLM server reachability check failed: {}\x1b[0m",
+            e
+        );
+        eprintln!(
+            "\x1b[33m  → run /ping for details, or restart the server.\x1b[0m"
+        );
+    }
+
     let mut rl = rustyline::DefaultEditor::new()?;
     rl.bind_sequence(
         Event::KeySeq(vec![KeyEvent(KeyCode::BackTab, Modifiers::NONE)]),
@@ -370,6 +383,13 @@ async fn repl(client: &mut LlmClient, skills: &SkillRegistry, workdir: &PathBuf)
                 }
                 if stripped == "/todos" {
                     println!("{}", todo.render());
+                    continue;
+                }
+                if stripped == "/ping" {
+                    match client.ping().await {
+                        Ok(info) => println!("\x1b[32m[ping ok]\x1b[0m {}", info),
+                        Err(e) => println!("\x1b[31m[ping failed]\x1b[0m {}", e),
+                    }
                     continue;
                 }
                 if stripped == "/tokens" {

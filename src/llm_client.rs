@@ -10,7 +10,7 @@
 ///
 use std::io::{self, Write};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
@@ -195,6 +195,25 @@ impl LlmClient {
         self.config.reclamp();
     }
 
+    /// Lightweight reachability check against the OpenAI-compatible
+    /// `/v1/models` endpoint. Returns a one-line description on success
+    /// (any HTTP response counts as "server is alive"), or an error chain
+    /// with the underlying I/O cause on transport failure.
+    pub async fn ping(&self) -> Result<String> {
+        let url = format!("{}/models", self.config.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .send()
+            .await
+            .map_err(|e| anyhow!("ping connect: {}", describe_error_chain(&e)))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let preview: String = body.chars().take(160).collect();
+        Ok(format!("HTTP {} from {} — body: {}", status, url, preview))
+    }
+
     /// Streaming chat completion with tool support.
     pub async fn chat(&self, messages: &[Message], tools: Option<&[Value]>) -> Result<ChatResult> {
         let body = build_chat_body(&self.config, messages, tools, true);
@@ -236,10 +255,13 @@ impl LlmClient {
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(|e| anyhow!("summarize send: {}", describe_error_chain(&e)))?
+            .error_for_status()
+            .map_err(|e| anyhow!("summarize status: {}", describe_error_chain(&e)))?
             .json()
-            .await?;
+            .await
+            .map_err(|e| anyhow!("summarize decode: {}", describe_error_chain(&e)))?;
         Ok(resp["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("(empty summary)")
@@ -319,12 +341,13 @@ impl LlmClient {
                 // sometimes does this on hitting max_tokens) — treat as end.
                 Err(reqwest_eventsource::Error::StreamEnded) => break,
                 Err(e) => {
+                    let chain = describe_error_chain(&e);
                     let prompt_tok_est = serde_json::to_string(body)
                         .map(|s| s.len() / 4)
                         .unwrap_or(0);
                     bail!(
-                        "SSE stream error: {} (prompt≈{} tok, max_tokens={}, n_ctx={} — server may have rejected oversized prompt; try /clear, /compact, or lower /maxtokens)",
-                        e,
+                        "SSE stream error: {} (prompt≈{} tok, max_tokens={}, n_ctx={} — try /ping to test server, or /clear/compact/maxtokens)",
+                        chain,
                         prompt_tok_est,
                         self.config.max_tokens,
                         self.config.context_tokens
@@ -351,6 +374,26 @@ impl LlmClient {
             finish_reason,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Error formatting
+// ---------------------------------------------------------------------------
+
+/// Walk `std::error::Error::source()` and join each layer's `Display` with " → ".
+/// reqwest's outer error often hides the underlying I/O cause (e.g. "Connection
+/// refused (os error 10061)") that the user actually needs to see.
+fn describe_error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = vec![err.to_string()];
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        let s = e.to_string();
+        if !parts.last().map_or(false, |p| p == &s) {
+            parts.push(s);
+        }
+        cur = e.source();
+    }
+    parts.join(" → ")
 }
 
 // ---------------------------------------------------------------------------
